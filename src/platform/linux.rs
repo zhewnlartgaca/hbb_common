@@ -377,6 +377,47 @@ pub struct WaylandDisplayInfo {
 }
 
 // Retrieves information about all connected displays via the Wayland protocol.
+/// Connect to the compositor socket sitting in `XDG_RUNTIME_DIR` when `WAYLAND_DISPLAY` is not set.
+///
+/// A login screen is the case this exists for. The greeter's `--server` is started deliberately
+/// without the compositor variables, because the DRM capture path talks to the root service and a
+/// render node and never to the compositor -- but the compositor IS running, and its socket is
+/// owned by the very user this process runs as. Measured at an sddm greeter: `/run/user/112/wayland-0`
+/// exists, a plain `connect(2)` as that user succeeds, and the registry advertises `wl_output`.
+///
+/// Without this the output layout is unavailable at a login screen, and everything downstream has
+/// to guess: every DRM display reports origin (0,0) because on Wayland each output scans out of its
+/// own framebuffer, so the uinput pointer range collapsed to a single display on a multi-monitor
+/// greeter.
+///
+/// Strictly a fallback after `connect_to_env` has already failed, so it cannot change any host
+/// where that succeeds; and where there is no compositor at all the socket is simply absent and
+/// this fails exactly as before.
+#[cfg(target_os = "linux")]
+fn connect_to_runtime_dir_socket() -> ResultType<Connection> {
+    use std::os::unix::net::UnixStream;
+    let dir = std::env::var("XDG_RUNTIME_DIR")?;
+    let mut last = None;
+    // Compositors name the socket `wayland-N`; 0 and 1 cover a greeter and a session started after
+    // it. Anything beyond that is not worth probing blind.
+    for name in ["wayland-0", "wayland-1"] {
+        let path = std::path::Path::new(&dir).join(name);
+        if !path.exists() {
+            continue;
+        }
+        match UnixStream::connect(&path).map_err(anyhow::Error::from).and_then(|s| {
+            Connection::from_socket(s).map_err(anyhow::Error::from)
+        }) {
+            Ok(conn) => return Ok(conn),
+            Err(err) => last = Some(format!("{}: {err}", path.display())),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no usable wayland socket in XDG_RUNTIME_DIR ({})",
+        last.unwrap_or_else(|| "none present".to_owned())
+    ))
+}
+
 pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
     struct WaylandEnv {
         registry_state: RegistryState,
@@ -404,7 +445,11 @@ pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
     sctk::delegate_output!(WaylandEnv);
     sctk::delegate_registry!(WaylandEnv);
 
-    let conn = Connection::connect_to_env()?;
+    let conn = match Connection::connect_to_env() {
+        Ok(conn) => conn,
+        Err(err) => connect_to_runtime_dir_socket()
+            .map_err(|fallback_err| anyhow::anyhow!("{err}; {fallback_err}"))?,
+    };
     let (globals, mut event_queue) = globals::registry_queue_init(&conn)?;
     let queue_handle = event_queue.handle();
 
