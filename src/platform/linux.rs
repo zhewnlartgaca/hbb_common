@@ -1,4 +1,4 @@
-use crate::ResultType;
+use crate::{bail, ResultType};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -377,45 +377,46 @@ pub struct WaylandDisplayInfo {
 }
 
 // Retrieves information about all connected displays via the Wayland protocol.
-/// Connect to the compositor socket sitting in `XDG_RUNTIME_DIR` when `WAYLAND_DISPLAY` is not set.
-///
-/// A login screen is the case this exists for. The greeter's `--server` is started deliberately
-/// without the compositor variables, because the DRM capture path talks to the root service and a
-/// render node and never to the compositor -- but the compositor IS running, and its socket is
-/// owned by the very user this process runs as. Measured at an sddm greeter: `/run/user/112/wayland-0`
-/// exists, a plain `connect(2)` as that user succeeds, and the registry advertises `wl_output`.
-///
-/// Without this the output layout is unavailable at a login screen, and everything downstream has
-/// to guess: every DRM display reports origin (0,0) because on Wayland each output scans out of its
-/// own framebuffer, so the uinput pointer range collapsed to a single display on a multi-monitor
-/// greeter.
-///
-/// Strictly a fallback after `connect_to_env` has already failed, so it cannot change any host
-/// where that succeeds; and where there is no compositor at all the socket is simply absent and
-/// this fails exactly as before.
+// A greeter's `--server` is started without the compositor variables, so nothing tells
+// the enumerator where a compositor that IS running lives. Only when nothing was told:
+// an explicit endpoint that fails must not silently reattach to a different compositor.
 #[cfg(target_os = "linux")]
 fn connect_to_runtime_dir_socket() -> ResultType<Connection> {
     use std::os::unix::net::UnixStream;
-    let dir = std::env::var("XDG_RUNTIME_DIR")?;
-    let mut last = None;
-    // Compositors name the socket `wayland-N`; 0 and 1 cover a greeter and a session started after
-    // it. Anything beyond that is not worth probing blind.
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("WAYLAND_SOCKET").is_some()
+    {
+        bail!("an explicit wayland endpoint is set and did not connect");
+    }
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => bail!("XDG_RUNTIME_DIR is not set"),
+    };
+    // Relative would probe against the working directory, not the runtime directory.
+    if !dir.is_absolute() {
+        bail!("XDG_RUNTIME_DIR is not absolute: {}", dir.display());
+    }
+    let mut errs = Vec::new();
     for name in ["wayland-0", "wayland-1"] {
-        let path = std::path::Path::new(&dir).join(name);
+        let path = dir.join(name);
         if !path.exists() {
             continue;
         }
-        match UnixStream::connect(&path).map_err(anyhow::Error::from).and_then(|s| {
-            Connection::from_socket(s).map_err(anyhow::Error::from)
-        }) {
+        match UnixStream::connect(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|s| Connection::from_socket(s).map_err(anyhow::Error::from))
+        {
             Ok(conn) => return Ok(conn),
-            Err(err) => last = Some(format!("{}: {err}", path.display())),
+            Err(err) => errs.push(format!("{}: {err}", path.display())),
         }
     }
-    Err(anyhow::anyhow!(
+    bail!(
         "no usable wayland socket in XDG_RUNTIME_DIR ({})",
-        last.unwrap_or_else(|| "none present".to_owned())
-    ))
+        if errs.is_empty() {
+            "none present".to_owned()
+        } else {
+            errs.join("; ")
+        }
+    )
 }
 
 pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
