@@ -515,7 +515,15 @@ fn probe_runtime_dir(dir: &Path) -> ResultType<Vec<WaylandDisplayInfo>> {
             Ok(displays) if displays.is_empty() => {
                 errs.push(format!("{}: no outputs yet", path.display()))
             }
-            Ok(displays) => return Ok(displays),
+            Ok(displays) => {
+                // Which socket answered, when nothing in the environment named one.
+                log::debug!(
+                    "wayland: {} output(s) from {}, found by scanning",
+                    displays.len(),
+                    path.display()
+                );
+                return Ok(displays);
+            }
             Err(err) => errs.push(format!("{}: {err}", path.display())),
         }
     }
