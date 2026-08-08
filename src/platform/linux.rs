@@ -376,41 +376,152 @@ pub struct WaylandDisplayInfo {
     pub refresh_rate: i32,
 }
 
-// Retrieves information about all connected displays via the Wayland protocol.
-// A greeter's `--server` is started without the compositor variables, so nothing tells
-// the enumerator where a compositor that IS running lives. Only when nothing was told:
-// an explicit endpoint that fails must not silently reattach to a different compositor.
 #[cfg(target_os = "linux")]
-fn connect_to_runtime_dir_socket() -> ResultType<Connection> {
-    use std::os::unix::net::UnixStream;
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("WAYLAND_SOCKET").is_some()
-    {
+const RUNTIME_DIR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(target_os = "linux")]
+static RUNTIME_DIR_PROBE_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Clears the in-flight flag even if the probe thread unwinds, so a panic does not disable the
+/// fallback for the rest of the process.
+#[cfg(target_os = "linux")]
+struct ProbeBusyGuard;
+
+#[cfg(target_os = "linux")]
+impl Drop for ProbeBusyGuard {
+    fn drop(&mut self) {
+        RUNTIME_DIR_PROBE_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+static ENDPOINT_WAS_NAMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the environment ever named a wayland endpoint in this process. Empty is not a name.
+///
+/// Read before `connect_to_env`, which removes `WAYLAND_SOCKET` from the environment on both its
+/// success and its bad-fd path; and latched, so a consumed variable cannot turn a process that WAS
+/// pointed at a compositor into one that is free to go looking for another.
+#[cfg(target_os = "linux")]
+fn env_names_wayland_endpoint() -> bool {
+    use std::sync::atomic::Ordering;
+    let named = ["WAYLAND_DISPLAY", "WAYLAND_SOCKET"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+    if named {
+        ENDPOINT_WAS_NAMED.store(true, Ordering::Release);
+    }
+    ENDPOINT_WAS_NAMED.load(Ordering::Acquire)
+}
+
+/// `/run/user/<uid>` of the active seat0 session, a greeter included.
+///
+/// Derived from the uid rather than read from `XDG_RUNTIME_DIR`: the root service is given no such
+/// variable, and `get_home_dir_trusted` below refuses to trust the environment for the same reason.
+#[cfg(target_os = "linux")]
+fn seat0_runtime_dir() -> ResultType<PathBuf> {
+    let uid = get_values_of_seat0_with_gdm_wayland(&[1]).remove(0);
+    if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("no active seat0 session to take a runtime directory from");
+    }
+    Ok(PathBuf::from(format!("/run/user/{uid}")))
+}
+
+/// The wayland sockets present in `dir`, lowest display number first.
+///
+/// Scanned rather than guessed: `wl_display_add_socket_auto` takes the first FREE name up to
+/// `wayland-32`, and a greeter is where leftovers accumulate across compositor restarts. Only that
+/// name pattern, because the same directory holds pipewire and dbus sockets.
+#[cfg(target_os = "linux")]
+fn wayland_sockets_in(dir: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut paths: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("wayland-")
+                    && !name.ends_with(".lock")
+                    && entry.file_type().map(|t| t.is_socket()).unwrap_or(false)
+            })
+            .map(|entry| entry.path())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    paths.sort_by_key(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("wayland-"))
+            .and_then(|number| number.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    });
+    paths
+}
+
+/// Enumerate through a socket in the seat0 runtime directory, for the case where nothing named an
+/// endpoint: a greeter's `--server` and the root service are given no compositor variables, so
+/// nothing tells the enumerator where a compositor that IS running lives. An endpoint that WAS
+/// named and failed must not silently reattach to a different compositor.
+///
+/// Off this thread and bounded, because the caller holds a process-wide lock across the call while
+/// `connect(2)` parks on a full backlog, sctk's roundtrip polls without a deadline, and sctk panics
+/// on malformed output events. A probe that never returns leaves one thread behind, and every later
+/// call then fails fast instead of stalling.
+#[cfg(target_os = "linux")]
+fn wayland_displays_from_runtime_dir(named_endpoint: bool) -> ResultType<Vec<WaylandDisplayInfo>> {
+    use std::sync::atomic::Ordering;
+    if named_endpoint {
         bail!("an explicit wayland endpoint is set and did not connect");
     }
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) => std::path::PathBuf::from(dir),
-        None => bail!("XDG_RUNTIME_DIR is not set"),
-    };
-    // Relative would probe against the working directory, not the runtime directory.
-    if !dir.is_absolute() {
-        bail!("XDG_RUNTIME_DIR is not absolute: {}", dir.display());
+    let dir = seat0_runtime_dir()?;
+    if RUNTIME_DIR_PROBE_BUSY.swap(true, Ordering::AcqRel) {
+        bail!("an earlier probe of {} has not returned", dir.display());
     }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let probe_dir = dir.clone();
+    // Builder, because `thread::spawn` PANICS when the thread cannot be created, and that would
+    // unwind through a caller holding a process-wide lock.
+    if let Err(err) = std::thread::Builder::new()
+        .name("wayland-socket-probe".into())
+        .spawn(move || {
+            let _guard = ProbeBusyGuard;
+            let _ = tx.send(probe_runtime_dir(&probe_dir));
+        })
+    {
+        RUNTIME_DIR_PROBE_BUSY.store(false, Ordering::Release);
+        bail!("could not spawn the wayland socket probe: {err}");
+    }
+    match rx.recv_timeout(RUNTIME_DIR_PROBE_TIMEOUT) {
+        Ok(res) => res,
+        Err(_) => bail!("no answer from a wayland socket in {}", dir.display()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_runtime_dir(dir: &Path) -> ResultType<Vec<WaylandDisplayInfo>> {
+    use std::os::unix::net::UnixStream;
     let mut errs = Vec::new();
-    for name in ["wayland-0", "wayland-1"] {
-        let path = dir.join(name);
-        if !path.exists() {
-            continue;
-        }
+    for path in wayland_sockets_in(dir) {
         match UnixStream::connect(&path)
             .map_err(anyhow::Error::from)
             .and_then(|s| Connection::from_socket(s).map_err(anyhow::Error::from))
+            .and_then(|conn| collect_wayland_displays(&conn))
         {
-            Ok(conn) => return Ok(conn),
+            // The caller caches an empty list as ground truth for the process lifetime, and a
+            // compositor still probing its monitors is exactly what this path connects to.
+            Ok(displays) if displays.is_empty() => {
+                errs.push(format!("{}: no outputs yet", path.display()))
+            }
+            Ok(displays) => return Ok(displays),
             Err(err) => errs.push(format!("{}: {err}", path.display())),
         }
     }
     bail!(
-        "no usable wayland socket in XDG_RUNTIME_DIR ({})",
+        "no usable wayland socket in {} ({})",
+        dir.display(),
         if errs.is_empty() {
             "none present".to_owned()
         } else {
@@ -419,7 +530,18 @@ fn connect_to_runtime_dir_socket() -> ResultType<Connection> {
     )
 }
 
+// Retrieves information about all connected displays via the Wayland protocol.
 pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
+    // Read before connecting: `connect_to_env` consumes `WAYLAND_SOCKET`.
+    let named_endpoint = env_names_wayland_endpoint();
+    match Connection::connect_to_env() {
+        Ok(conn) => collect_wayland_displays(&conn),
+        Err(err) => wayland_displays_from_runtime_dir(named_endpoint)
+            .map_err(|fallback_err| anyhow::anyhow!("{err}; {fallback_err}")),
+    }
+}
+
+fn collect_wayland_displays(conn: &Connection) -> ResultType<Vec<WaylandDisplayInfo>> {
     struct WaylandEnv {
         registry_state: RegistryState,
         output_state: OutputState,
@@ -440,18 +562,13 @@ pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
             &mut self.registry_state
         }
 
-        sctk::registry_handlers!();
+        sctk::registry_handlers![OutputState];
     }
 
     sctk::delegate_output!(WaylandEnv);
     sctk::delegate_registry!(WaylandEnv);
 
-    let conn = match Connection::connect_to_env() {
-        Ok(conn) => conn,
-        Err(err) => connect_to_runtime_dir_socket()
-            .map_err(|fallback_err| anyhow::anyhow!("{err}; {fallback_err}"))?,
-    };
-    let (globals, mut event_queue) = globals::registry_queue_init(&conn)?;
+    let (globals, mut event_queue) = globals::registry_queue_init(conn)?;
     let queue_handle = event_queue.handle();
 
     let registry_state = RegistryState::new(&globals);
