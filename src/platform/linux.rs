@@ -543,6 +543,19 @@ fn wayland_displays_from_runtime_dir(named_endpoint: bool) -> ResultType<Vec<Way
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // An unwired binary runs its normal startup, and a long-running one (the
+                // server itself) lands HERE rather than at the handshake check below — latch
+                // on this path too, or every enumeration cycle spawns a full consumer
+                // process. Judged by what the child already wrote: a real probe prints the
+                // magic line first and flushes, so its absence after a whole deadline means
+                // this is not a probe. Only buffered bytes are read — a blocking read could
+                // hang on a grandchild that inherited the write end.
+                if first_buffered_line(child.stdout.take()).as_deref()
+                    != Some(WAYLAND_PROBE_MAGIC)
+                {
+                    PROBE_UNSUPPORTED.store(true, Ordering::Release);
+                    bail!("the wayland socket probe timed out without the handshake; probe disabled");
+                }
                 bail!("the wayland socket probe did not answer and was killed");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(25)),
@@ -564,9 +577,18 @@ fn wayland_displays_from_runtime_dir(named_endpoint: bool) -> ResultType<Vec<Way
         bail!("this binary does not dispatch {WAYLAND_DISPLAY_PROBE_ARG}; probe disabled");
     }
     if !status.success() {
-        bail!("wayland socket probe: {}", stderr.trim());
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            // panic=abort or a signal leaves stderr empty; the status is then the only cause.
+            bail!("wayland socket probe failed: {status}");
+        }
+        bail!("wayland socket probe failed ({status}): {detail}");
     }
-    let displays: Vec<WaylandDisplayInfo> = serde_json::from_str(lines.next().unwrap_or_default())?;
+    let displays: Vec<WaylandDisplayInfo> = match serde_json::from_str(lines.next().unwrap_or_default())
+    {
+        Ok(displays) => displays,
+        Err(err) => bail!("wayland socket probe answered a malformed list: {err}"),
+    };
     // The child already refuses an empty list; refuse it here too, so a truncated pipe cannot
     // become a cached-for-life empty enumeration.
     if displays.is_empty() {
@@ -577,6 +599,32 @@ fn wayland_displays_from_runtime_dir(named_endpoint: bool) -> ResultType<Vec<Way
         displays.len()
     );
     Ok(displays)
+}
+
+/// The first line already sitting in the pipe buffer, read strictly non-blocking: children of a
+/// killed consumer can inherit the write end and keep it open, so an EOF-seeking read here could
+/// hang the enumeration forever.
+#[cfg(target_os = "linux")]
+fn first_buffered_line(pipe: Option<std::process::ChildStdout>) -> Option<String> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let mut pipe = pipe?;
+    let fd = pipe.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return None;
+        }
+    }
+    // The magic line is written in one flush and fits many times over; one read is enough.
+    let mut buf = vec![0u8; 256];
+    match pipe.read(&mut buf) {
+        Ok(n) => {
+            buf.truncate(n);
+            String::from_utf8_lossy(&buf).lines().next().map(str::to_owned)
+        }
+        Err(_) => None,
+    }
 }
 
 #[cfg(target_os = "linux")]
