@@ -365,7 +365,7 @@ pub fn system_message(title: &str, msg: &str, forever: bool) -> ResultType<()> {
     crate::bail!("failed to post system message");
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde_derive::Serialize, serde_derive::Deserialize)]
 pub struct WaylandDisplayInfo {
     pub name: String,
     pub x: i32,
@@ -379,12 +379,25 @@ pub struct WaylandDisplayInfo {
 #[cfg(target_os = "linux")]
 const RUNTIME_DIR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The argument the consumer binary must dispatch to `wayland_display_probe_child_main` before
+/// any other startup work; see that function for why the probe is its own process.
+#[cfg(target_os = "linux")]
+pub const WAYLAND_DISPLAY_PROBE_ARG: &str = "--wayland-display-probe";
+
+/// First stdout line of a probe child. A binary that does not dispatch the arg never prints it.
+#[cfg(target_os = "linux")]
+const WAYLAND_PROBE_MAGIC: &str = "wayland-display-probe-v1";
+
+/// Latched on a failed handshake: a consumer that does not dispatch the probe arg runs its NORMAL
+/// startup instead, and this path re-enters every enumeration cycle.
+#[cfg(target_os = "linux")]
+static PROBE_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(target_os = "linux")]
 static RUNTIME_DIR_PROBE_BUSY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Clears the in-flight flag even if the probe thread unwinds, so a panic does not disable the
-/// fallback for the rest of the process.
+/// Clears the in-flight flag on every exit path of the parent, error arms included.
 #[cfg(target_os = "linux")]
 struct ProbeBusyGuard;
 
@@ -393,6 +406,37 @@ impl Drop for ProbeBusyGuard {
     fn drop(&mut self) {
         RUNTIME_DIR_PROBE_BUSY.store(false, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// Entry point of the isolated probe process. The consumer binary dispatches
+/// `WAYLAND_DISPLAY_PROBE_ARG` here first, before config, logging or any other startup work.
+///
+/// Its own process because the release profile builds with panic=abort: sctk panics on malformed
+/// protocol bytes, and in-process that abort takes the whole server down. Here it takes down only
+/// this child, which the parent reports as a failed probe. The seat0 lookup also runs in here, so
+/// the parent's single deadline bounds the loginctl reads too.
+#[cfg(target_os = "linux")]
+pub fn wayland_display_probe_child_main() -> ! {
+    use std::io::Write;
+    // The handshake first, so the parent can tell this entry point ran and not a consumer binary
+    // that fell through to its normal startup.
+    println!("{WAYLAND_PROBE_MAGIC}");
+    let _ = std::io::stdout().flush();
+    let code = match seat0_runtime_dir()
+        .and_then(|dir| probe_runtime_dir(&dir))
+        .and_then(|displays| serde_json::to_string(&displays).map_err(anyhow::Error::from))
+    {
+        Ok(json) => {
+            println!("{json}");
+            0
+        }
+        Err(err) => {
+            eprintln!("{err:#}");
+            1
+        }
+    };
+    let _ = std::io::stdout().flush();
+    std::process::exit(code)
 }
 
 #[cfg(target_os = "linux")]
@@ -466,38 +510,73 @@ fn wayland_sockets_in(dir: &Path) -> Vec<PathBuf> {
 /// nothing tells the enumerator where a compositor that IS running lives. An endpoint that WAS
 /// named and failed must not silently reattach to a different compositor.
 ///
-/// Off this thread and bounded, because the caller holds a process-wide lock across the call while
-/// `connect(2)` parks on a full backlog, sctk's roundtrip polls without a deadline, and sctk panics
-/// on malformed output events. A probe that never returns leaves one thread behind, and every later
-/// call then fails fast instead of stalling.
+/// In a subprocess and bounded, because the caller holds a process-wide lock across the call while
+/// `connect(2)` parks on a full backlog and sctk's roundtrip polls without a deadline; and because
+/// sctk panics on malformed output events, which the release profile's panic=abort turns into an
+/// abort of the whole server. A child dies alone, and on the deadline it is killed instead of
+/// leaking a thread. The seat0 lookup runs inside the child, under the same deadline.
 #[cfg(target_os = "linux")]
 fn wayland_displays_from_runtime_dir(named_endpoint: bool) -> ResultType<Vec<WaylandDisplayInfo>> {
+    use std::io::Read;
     use std::sync::atomic::Ordering;
     if named_endpoint {
         bail!("an explicit wayland endpoint is set and did not connect");
     }
-    let dir = seat0_runtime_dir()?;
+    if PROBE_UNSUPPORTED.load(Ordering::Acquire) {
+        bail!("this binary does not dispatch {WAYLAND_DISPLAY_PROBE_ARG}");
+    }
     if RUNTIME_DIR_PROBE_BUSY.swap(true, Ordering::AcqRel) {
-        bail!("an earlier probe of {} has not returned", dir.display());
+        bail!("an earlier probe has not returned");
     }
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let probe_dir = dir.clone();
-    // Builder, because `thread::spawn` PANICS when the thread cannot be created, and that would
-    // unwind through a caller holding a process-wide lock.
-    if let Err(err) = std::thread::Builder::new()
-        .name("wayland-socket-probe".into())
-        .spawn(move || {
-            let _guard = ProbeBusyGuard;
-            let _ = tx.send(probe_runtime_dir(&probe_dir));
-        })
-    {
-        RUNTIME_DIR_PROBE_BUSY.store(false, Ordering::Release);
-        bail!("could not spawn the wayland socket probe: {err}");
+    let _busy = ProbeBusyGuard;
+    let exe = std::env::current_exe()?;
+    let mut child = std::process::Command::new(exe)
+        .arg(WAYLAND_DISPLAY_PROBE_ARG)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + RUNTIME_DIR_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("the wayland socket probe did not answer and was killed");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
     }
-    match rx.recv_timeout(RUNTIME_DIR_PROBE_TIMEOUT) {
-        Ok(res) => res,
-        Err(_) => bail!("no answer from a wayland socket in {}", dir.display()),
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
     }
+    let mut lines = stdout.lines();
+    if lines.next() != Some(WAYLAND_PROBE_MAGIC) {
+        // Not a probe: the binary ran its normal startup. Latch, or this path would spawn one
+        // full consumer process per enumeration cycle.
+        PROBE_UNSUPPORTED.store(true, Ordering::Release);
+        bail!("this binary does not dispatch {WAYLAND_DISPLAY_PROBE_ARG}; probe disabled");
+    }
+    if !status.success() {
+        bail!("wayland socket probe: {}", stderr.trim());
+    }
+    let displays: Vec<WaylandDisplayInfo> = serde_json::from_str(lines.next().unwrap_or_default())?;
+    // The child already refuses an empty list; refuse it here too, so a truncated pipe cannot
+    // become a cached-for-life empty enumeration.
+    if displays.is_empty() {
+        bail!("wayland socket probe returned no outputs");
+    }
+    log::debug!(
+        "wayland: {} output(s) via the probe subprocess",
+        displays.len()
+    );
+    Ok(displays)
 }
 
 #[cfg(target_os = "linux")]
