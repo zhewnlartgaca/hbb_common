@@ -423,7 +423,10 @@ pub fn wayland_display_probe_child_main() -> ! {
     println!("{WAYLAND_PROBE_MAGIC}");
     let _ = std::io::stdout().flush();
     let code = match seat0_runtime_dir()
-        .and_then(|dir| probe_runtime_dir(&dir))
+        .and_then(|dir| {
+            drop_to_dir_owner(&dir)?;
+            probe_runtime_dir(&dir)
+        })
         .and_then(|displays| serde_json::to_string(&displays).map_err(anyhow::Error::from))
     {
         Ok(json) => {
@@ -465,6 +468,33 @@ fn env_names_wayland_endpoint() -> bool {
 /// Derived from the uid rather than read from `XDG_RUNTIME_DIR`: the root service is given no such
 /// variable, and `get_home_dir_trusted` below refuses to trust the environment for the same reason.
 #[cfg(target_os = "linux")]
+/// The probe parses compositor-controlled protocol data; a root service must not do that as
+/// root. Before touching the socket, become the runtime directory's owner — and refuse to probe
+/// at all if the drop fails, since staying root is the one unacceptable outcome.
+#[cfg(target_os = "linux")]
+fn drop_to_dir_owner(dir: &Path) -> ResultType<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(dir)?;
+    let (uid, gid) = (meta.uid(), meta.gid());
+    if uid == 0 {
+        // Root's own session: there is no boundary to cross and nothing to drop to.
+        return Ok(());
+    }
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setgid(gid) != 0
+            || libc::setuid(uid) != 0
+            || libc::setuid(0) == 0
+        {
+            bail!("could not drop privileges for the socket probe");
+        }
+    }
+    Ok(())
+}
+
 fn seat0_runtime_dir() -> ResultType<PathBuf> {
     let uid = get_values_of_seat0_with_gdm_wayland(&[1]).remove(0);
     if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
@@ -530,18 +560,29 @@ fn wayland_displays_from_runtime_dir(named_endpoint: bool) -> ResultType<Vec<Way
     }
     let _busy = ProbeBusyGuard;
     let exe = std::env::current_exe()?;
+    // Its own process group, so the deadline can kill loginctl descendants along with the child,
+    // and so no surviving descendant can hold the pipes open past the reads below.
+    use std::os::unix::process::CommandExt;
     let mut child = std::process::Command::new(exe)
         .arg(WAYLAND_DISPLAY_PROBE_ARG)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .spawn()?;
+    let probe_pgid = child.id() as libc::pid_t;
+    let kill_probe_group = || unsafe {
+        let _ = libc::kill(-probe_pgid, libc::SIGKILL);
+    };
     let deadline = std::time::Instant::now() + RUNTIME_DIR_PROBE_TIMEOUT;
     let status = loop {
         match child.try_wait()? {
-            Some(status) => break status,
+            Some(status) => {
+                kill_probe_group();
+                break status;
+            }
             None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_probe_group();
                 let _ = child.wait();
                 // An unwired binary runs its normal startup, and a long-running one (the
                 // server itself) lands HERE rather than at the handshake check below — latch
@@ -550,13 +591,19 @@ fn wayland_displays_from_runtime_dir(named_endpoint: bool) -> ResultType<Vec<Way
                 // magic line first and flushes, so its absence after a whole deadline means
                 // this is not a probe. Only buffered bytes are read — a blocking read could
                 // hang on a grandchild that inherited the write end.
-                if first_buffered_line(child.stdout.take()).as_deref()
-                    != Some(WAYLAND_PROBE_MAGIC)
-                {
-                    PROBE_UNSUPPORTED.store(true, Ordering::Release);
-                    bail!("the wayland socket probe timed out without the handshake; probe disabled");
+                match first_buffered_line(child.stdout.take()) {
+                    // The pipe could not be inspected at all: no evidence, no latch.
+                    None => {
+                        bail!("the wayland socket probe timed out and its output was uninspectable")
+                    }
+                    Some(head) if head.as_deref() == Some(WAYLAND_PROBE_MAGIC) => {
+                        bail!("the wayland socket probe did not answer and was killed");
+                    }
+                    Some(_) => {
+                        PROBE_UNSUPPORTED.store(true, Ordering::Release);
+                        bail!("the wayland socket probe timed out without the handshake; probe disabled");
+                    }
                 }
-                bail!("the wayland socket probe did not answer and was killed");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
@@ -584,11 +631,11 @@ fn wayland_displays_from_runtime_dir(named_endpoint: bool) -> ResultType<Vec<Way
         }
         bail!("wayland socket probe failed ({status}): {detail}");
     }
-    let displays: Vec<WaylandDisplayInfo> = match serde_json::from_str(lines.next().unwrap_or_default())
-    {
-        Ok(displays) => displays,
-        Err(err) => bail!("wayland socket probe answered a malformed list: {err}"),
-    };
+    let displays: Vec<WaylandDisplayInfo> =
+        match serde_json::from_str(lines.next().unwrap_or_default()) {
+            Ok(displays) => displays,
+            Err(err) => bail!("wayland socket probe answered a malformed list: {err}"),
+        };
     // The child already refuses an empty list; refuse it here too, so a truncated pipe cannot
     // become a cached-for-life empty enumeration.
     if displays.is_empty() {
@@ -603,9 +650,11 @@ fn wayland_displays_from_runtime_dir(named_endpoint: bool) -> ResultType<Vec<Way
 
 /// The first line already sitting in the pipe buffer, read strictly non-blocking: children of a
 /// killed consumer can inherit the write end and keep it open, so an EOF-seeking read here could
-/// hang the enumeration forever.
+/// hang the enumeration forever. Outer `None` means the pipe could not be INSPECTED (missing
+/// handle, fcntl or read failure) and must not be read as evidence of anything; `Some(None)` is
+/// an inspected-and-empty buffer.
 #[cfg(target_os = "linux")]
-fn first_buffered_line(pipe: Option<std::process::ChildStdout>) -> Option<String> {
+fn first_buffered_line(pipe: Option<std::process::ChildStdout>) -> Option<Option<String>> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     let mut pipe = pipe?;
@@ -621,8 +670,16 @@ fn first_buffered_line(pipe: Option<std::process::ChildStdout>) -> Option<String
     match pipe.read(&mut buf) {
         Ok(n) => {
             buf.truncate(n);
-            String::from_utf8_lossy(&buf).lines().next().map(str::to_owned)
+            Some(
+                String::from_utf8_lossy(&buf)
+                    .lines()
+                    .next()
+                    .map(str::to_owned),
+            )
         }
+        // A drained pipe answers WouldBlock here, and an empty buffer after a whole deadline IS
+        // evidence; any error still counts as uninspectable.
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Some(None),
         Err(_) => None,
     }
 }
