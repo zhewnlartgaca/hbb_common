@@ -168,7 +168,6 @@ fn wayland_sockets_in(dir: &Path) -> Vec<PathBuf> {
 pub(super) fn wayland_displays_from_runtime_dir(
     named_endpoint: bool,
 ) -> ResultType<Vec<WaylandDisplayInfo>> {
-    use std::io::Read;
     use std::sync::atomic::Ordering;
     if named_endpoint {
         bail!("an explicit wayland endpoint is set and did not connect");
@@ -204,6 +203,10 @@ pub(super) fn wayland_displays_from_runtime_dir(
             }
             None if std::time::Instant::now() >= deadline => {
                 kill_probe_group();
+                // The direct pid too, not only its group: if the child left the group its own
+                // kill would miss it, and the wait below would then block on a live child. A
+                // pid-targeted SIGKILL is uncatchable, so wait() is bounded either way.
+                let _ = child.kill();
                 let _ = child.wait();
                 // An unwired binary runs its normal startup, and a long-running one (the
                 // server itself) lands HERE rather than at the handshake check below — latch
@@ -229,14 +232,11 @@ pub(super) fn wayland_displays_from_runtime_dir(
             None => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
     };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    // Drained non-blocking, not read_to_string: the child exited so its output is already
+    // buffered, but a descendant that escaped the process group could still hold a write end open
+    // and an EOF-seeking read would then hang here forever.
+    let stdout = drain_nonblocking(child.stdout.take()).unwrap_or_default();
+    let stderr = drain_nonblocking(child.stderr.take()).unwrap_or_default();
     let mut lines = stdout.lines();
     if lines.next() != Some(WAYLAND_PROBE_MAGIC) {
         // Not a probe: the binary ran its normal startup. Latch, or this path would spawn one
@@ -269,14 +269,12 @@ pub(super) fn wayland_displays_from_runtime_dir(
     Ok(displays)
 }
 
-/// The first line already sitting in the pipe buffer, read strictly non-blocking: children of a
-/// killed consumer can inherit the write end and keep it open, so an EOF-seeking read here could
-/// hang the enumeration forever. Outer `None` means the pipe could not be INSPECTED (missing
-/// handle, fcntl or read failure) and must not be read as evidence of anything; `Some(None)` is
-/// an inspected-and-empty buffer.
-fn first_buffered_line(pipe: Option<std::process::ChildStdout>) -> Option<Option<String>> {
-    use std::io::Read;
-    use std::os::fd::AsRawFd;
+/// Everything already buffered in the pipe, read strictly non-blocking and capped: a descendant
+/// that escaped the probe's process group can hold a write end open, so a blocking read (even
+/// after the child exits) could hang the enumeration forever. `None` means the pipe could not be
+/// INSPECTED (missing handle or fcntl failure) and must not be read as evidence of anything;
+/// `Some` is whatever bytes were buffered, whether or not EOF arrived.
+fn drain_nonblocking<R: std::io::Read + std::os::fd::AsRawFd>(pipe: Option<R>) -> Option<String> {
     let mut pipe = pipe?;
     let fd = pipe.as_raw_fd();
     unsafe {
@@ -285,23 +283,32 @@ fn first_buffered_line(pipe: Option<std::process::ChildStdout>) -> Option<Option
             return None;
         }
     }
-    // The magic line is written in one flush and fits many times over; one read is enough.
-    let mut buf = vec![0u8; 256];
-    match pipe.read(&mut buf) {
-        Ok(n) => {
-            buf.truncate(n);
-            Some(
-                String::from_utf8_lossy(&buf)
-                    .lines()
-                    .next()
-                    .map(str::to_owned),
-            )
+    // Capped so a descendant that keeps writing cannot spin this read forever.
+    const CAP: usize = 64 * 1024;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break, // EOF: the write end is fully closed
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.len() >= CAP {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            // WouldBlock: what is buffered is drained (a descendant may still hold the writer).
+            // Any other error: stop with what we have.
+            Err(_) => break,
         }
-        // A drained pipe answers WouldBlock here, and an empty buffer after a whole deadline IS
-        // evidence; any error still counts as uninspectable.
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Some(None),
-        Err(_) => None,
     }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// The first line the child buffered, for the timeout latch decision. `Some(None)` is an
+/// inspected-but-empty buffer (genuine absence of the handshake); outer `None` is uninspectable.
+fn first_buffered_line(pipe: Option<std::process::ChildStdout>) -> Option<Option<String>> {
+    drain_nonblocking(pipe).map(|s| s.lines().next().map(str::to_owned))
 }
 
 fn probe_runtime_dir(dir: &Path) -> ResultType<Vec<WaylandDisplayInfo>> {
