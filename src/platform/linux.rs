@@ -374,6 +374,12 @@ pub struct WaylandDisplayInfo {
     pub height: i32,
     pub logical_size: Option<(i32, i32)>,
     pub refresh_rate: i32,
+    /// Output rotation in degrees (0/90/180/270), from `wl_output.geometry`. The mode keeps its
+    /// unrotated dimensions and `logical_size` arrives already swapped, so without this field a
+    /// rotated output is indistinguishable from a scaled one. Flipped variants map to their
+    /// rotation. Defaulted so a serialized snapshot from an older probe child still deserializes.
+    #[serde(default)]
+    pub transform: i32,
 }
 
 /// The isolated socket-probe fallback, in its own file and behind the `wayland_probe` feature so
@@ -397,6 +403,20 @@ pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
         #[cfg(feature = "wayland_probe")]
         Err(err) => wayland_probe::wayland_displays_from_runtime_dir(named_endpoint)
             .map_err(|fallback_err| anyhow::anyhow!("{err}; {fallback_err}")),
+    }
+}
+
+/// `wl_output::Transform` as degrees. Flipped variants report their rotation: the frame still
+/// needs that turn to read upright, and a desktop compositor flipping an output without rotating
+/// it is not a case any of ours can produce to test the mirror half against.
+fn transform_degrees(t: sctk::reexports::client::protocol::wl_output::Transform) -> i32 {
+    use sctk::reexports::client::protocol::wl_output::Transform;
+    match t {
+        Transform::Normal | Transform::Flipped => 0,
+        Transform::_90 | Transform::Flipped90 => 90,
+        Transform::_180 | Transform::Flipped180 => 180,
+        Transform::_270 | Transform::Flipped270 => 270,
+        _ => 0,
     }
 }
 
@@ -452,6 +472,7 @@ fn collect_wayland_displays(conn: &Connection) -> ResultType<Vec<WaylandDisplayI
                     let refresh_rate = mode.refresh_rate;
                     let name = info.name.clone().unwrap_or_default();
                     let logical_size = info.logical_size;
+                    let transform = transform_degrees(info.transform);
                     display_infos.push(WaylandDisplayInfo {
                         name,
                         x,
@@ -460,6 +481,7 @@ fn collect_wayland_displays(conn: &Connection) -> ResultType<Vec<WaylandDisplayI
                         height,
                         logical_size,
                         refresh_rate,
+                        transform,
                     });
                 }
             });
