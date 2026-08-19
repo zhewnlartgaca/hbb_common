@@ -2982,6 +2982,7 @@ pub mod keys {
     pub const OPTION_PRESET_USERNAME: &str = "preset-user-name";
     pub const OPTION_PRESET_STRATEGY_NAME: &str = "preset-strategy-name";
     pub const OPTION_REMOVE_PRESET_PASSWORD_WARNING: &str = "remove-preset-password-warning";
+    pub const OPTION_HIDE_GENERAL_SETTINGS: &str = "hide-general-settings";
     pub const OPTION_HIDE_SECURITY_SETTINGS: &str = "hide-security-settings";
     pub const OPTION_HIDE_NETWORK_SETTINGS: &str = "hide-network-settings";
     pub const OPTION_HIDE_SERVER_SETTINGS: &str = "hide-server-settings";
@@ -3202,6 +3203,7 @@ pub mod keys {
         OPTION_PRESET_USERNAME,
         OPTION_PRESET_STRATEGY_NAME,
         OPTION_REMOVE_PRESET_PASSWORD_WARNING,
+        OPTION_HIDE_GENERAL_SETTINGS,
         OPTION_HIDE_SECURITY_SETTINGS,
         OPTION_HIDE_NETWORK_SETTINGS,
         OPTION_HIDE_SERVER_SETTINGS,
