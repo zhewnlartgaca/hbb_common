@@ -126,15 +126,32 @@ impl WebRTCStream {
         Self::get_key_for_sdp(&sdp)
     }
 
-    #[inline]
-    async fn get_key_for_peer(pc: &Arc<RTCPeerConnection>, is_local: bool) -> ResultType<String> {
-        let Some(desc) = (match is_local {
-            true => pc.local_description().await,
-            false => pc.remote_description().await,
-        }) else {
-            return Err(anyhow::anyhow!("PeerConnection description is not set"));
-        };
-        Self::get_key_for_sdp(&desc)
+    fn remove_sessions_for_peer(
+        sessions: &mut HashMap<String, WebRTCStream>,
+        pc: &Arc<RTCPeerConnection>,
+    ) -> Vec<String> {
+        let keys: Vec<String> = sessions
+            .iter()
+            .filter_map(|(key, session)| {
+                Arc::ptr_eq(&session.pc, pc).then(|| key.clone())
+            })
+            .collect();
+        for key in &keys {
+            sessions.remove(key);
+        }
+        keys
+    }
+
+    async fn cache_or_reuse_session(key: String, webrtc_stream: Self) -> Self {
+        let mut sessions_lock = SESSIONS.lock().await;
+        if let Some(session) = sessions_lock.get(&key).cloned() {
+            drop(sessions_lock);
+            webrtc_stream.pc.close().await.ok();
+            return session;
+        }
+
+        sessions_lock.insert(key, webrtc_stream.clone());
+        webrtc_stream
     }
 
     #[inline]
@@ -299,36 +316,16 @@ impl WebRTCStream {
                     | RTCPeerConnectionState::Closed => {
                         let _ = on_connection_notify.send(true);
                         log::debug!("WebRTC session closing due to disconnected");
-                        let _ = stream_for_close2.lock().await.close().await;
+                        let stream = stream_for_close2.lock().await.clone();
+                        let _ = stream.close().await;
                         log::debug!("WebRTC session stream closed");
 
                         let mut sessions_lock = SESSIONS.lock().await;
-                        match Self::get_key_for_peer(&pc_for_close2, start_local_offer).await {
-                            Ok(k) => {
-                                sessions_lock.remove(&k);
-                                log::debug!("WebRTC session removed key: {}", k);
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "Failed to extract key for peer during session cleanup: {:?}",
-                                    e
-                                );
-                                // Fallback: try to remove any session associated with this peer connection
-                                let keys_to_remove: Vec<String> = sessions_lock
-                                    .iter()
-                                    .filter_map(|(key, session)| {
-                                        if Arc::ptr_eq(&session.pc, &pc_for_close2) {
-                                            Some(key.clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                for k in keys_to_remove {
-                                    sessions_lock.remove(&k);
-                                    log::debug!("WebRTC session removed by fallback key: {}", k);
-                                }
-                            }
+                        for key in Self::remove_sessions_for_peer(
+                            &mut sessions_lock,
+                            &pc_for_close2,
+                        ) {
+                            log::debug!("WebRTC session removed key: {}", key);
                         }
                     }
                     _ => {}
@@ -361,20 +358,13 @@ impl WebRTCStream {
             log::debug!("Start webrtc with remote key: {}", key);
         }
 
-        let mut final_lock = SESSIONS.lock().await;
-        if let Some(session) = final_lock.get(&key) {
-            pc.close().await.ok();
-            return Ok(session.clone());
-        }
-
         let webrtc_stream = Self {
             pc,
             stream,
             state_notify: notify_rx,
             send_timeout: ms_timeout,
         };
-        final_lock.insert(key, webrtc_stream.clone());
-        Ok(webrtc_stream)
+        Ok(Self::cache_or_reuse_session(key, webrtc_stream).await)
     }
 
     #[inline]
@@ -513,10 +503,36 @@ pub fn is_webrtc_endpoint(endpoint: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use crate::config;
-    use crate::webrtc::WebRTCStream;
-    use crate::webrtc::DEFAULT_ICE_SERVERS;
+    use crate::webrtc::{WebRTCStream, DEFAULT_ICE_SERVERS, SESSIONS};
+    use tokio::sync::{watch, Mutex};
+    use tokio::time::timeout;
+    use webrtc::api::APIBuilder;
+    use webrtc::data_channel::RTCDataChannel;
+    use webrtc::peer_connection::configuration::RTCConfiguration;
+    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
     use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+
+    async fn new_test_stream() -> WebRTCStream {
+        let api = APIBuilder::new().build();
+        let pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        let (_, state_notify) = watch::channel(false);
+        WebRTCStream {
+            pc,
+            stream: Arc::new(Mutex::new(Arc::new(RTCDataChannel::default()))),
+            state_notify,
+            send_timeout: 0,
+        }
+    }
 
     #[test]
     fn test_webrtc_ice_url() {
@@ -766,5 +782,76 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             WebRTCStream::new(&endpoint, false, 10000).await.is_err(),
             "connect to an 'answer' webrtc endpoint should error"
         );
+    }
+
+    #[tokio::test]
+    async fn test_reusing_cached_session_does_not_deadlock_during_close() {
+        let key = "test-reusing-cached-session".to_owned();
+        let cached = new_test_stream().await;
+        let candidate = new_test_stream().await;
+        let close_callback_completed = Arc::new(AtomicBool::new(false));
+        let close_callback_completed2 = close_callback_completed.clone();
+
+        candidate
+            .pc
+            .on_peer_connection_state_change(Box::new(move |state| {
+                let close_callback_completed = close_callback_completed2.clone();
+                Box::pin(async move {
+                    if state == RTCPeerConnectionState::Closed {
+                        let _sessions_lock = SESSIONS.lock().await;
+                        close_callback_completed.store(true, Ordering::SeqCst);
+                    }
+                })
+            }));
+
+        SESSIONS.lock().await.insert(key.clone(), cached.clone());
+        let reused = timeout(
+            Duration::from_secs(5),
+            WebRTCStream::cache_or_reuse_session(key.clone(), candidate),
+        )
+        .await
+        .expect("closing a duplicate peer deadlocked on the session cache");
+
+        assert!(Arc::ptr_eq(&reused.pc, &cached.pc));
+        assert!(close_callback_completed.load(Ordering::SeqCst));
+
+        SESSIONS.lock().await.remove(&key);
+        cached.pc.close().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_session_cleanup_only_removes_matching_peer() {
+        let key = "test-session-cleanup".to_owned();
+        let old_key = "test-session-cleanup-old".to_owned();
+        let old = new_test_stream().await;
+        let replacement = new_test_stream().await;
+        let mut sessions = HashMap::new();
+        sessions.insert(key.clone(), replacement.clone());
+
+        assert!(WebRTCStream::remove_sessions_for_peer(&mut sessions, &old.pc).is_empty());
+        assert!(Arc::ptr_eq(
+            &sessions.get(&key).unwrap().pc,
+            &replacement.pc,
+        ));
+
+        sessions.insert(old_key.clone(), old.clone());
+        assert_eq!(
+            WebRTCStream::remove_sessions_for_peer(&mut sessions, &old.pc),
+            vec![old_key.clone()],
+        );
+        assert!(!sessions.contains_key(&old_key));
+        assert!(Arc::ptr_eq(
+            &sessions.get(&key).unwrap().pc,
+            &replacement.pc,
+        ));
+
+        assert_eq!(
+            WebRTCStream::remove_sessions_for_peer(&mut sessions, &replacement.pc),
+            vec![key.clone()],
+        );
+        assert!(!sessions.contains_key(&key));
+
+        old.pc.close().await.ok();
+        replacement.pc.close().await.ok();
     }
 }
