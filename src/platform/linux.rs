@@ -467,7 +467,11 @@ fn collect_wayland_displays(conn: &Connection) -> ResultType<Vec<WaylandDisplayI
         if let Some(output_data) = output.data::<OutputData>() {
             output_data.with_output_info(|info| {
                 if let Some(mode) = info.modes.iter().find(|m| m.current) {
-                    let (x, y) = info.location;
+                    // wlroots compositors leave wl_output.geometry at (0, 0) for every output and
+                    // publish the real layout only through xdg-output, so taking `location` there
+                    // stacks the whole desktop on the origin. Mutter fills both, so this stays a
+                    // no-op on GNOME.
+                    let (x, y) = info.logical_position.unwrap_or(info.location);
                     let (width, height) = mode.dimensions;
                     let refresh_rate = mode.refresh_rate;
                     let name = info.name.clone().unwrap_or_default();
