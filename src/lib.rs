@@ -459,7 +459,7 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                     .rotate(
                         Criterion::Age(Age::Day),
                         Naming::Timestamps,
-                        Cleanup::KeepLogFiles(31),
+                        Cleanup::KeepLogFiles(90),
                     )
                     .start()
                     .ok();
