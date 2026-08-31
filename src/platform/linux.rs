@@ -406,16 +406,35 @@ pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
     }
 }
 
-/// `wl_output::Transform` as degrees. Flipped variants report their rotation: the frame still
-/// needs that turn to read upright, and a desktop compositor flipping an output without rotating
-/// it is not a case any of ours can produce to test the mirror half against.
+/// `wl_output::Transform` as degrees. Flipped variants report their rotation ONLY: wayland
+/// defines them as a vertical-axis mirror followed by the rotation, and the mirror half is
+/// dropped here - a consumer correcting frames by this value serves a flipped output mirrored.
+/// Said once in the log rather than silently, because no compositor of ours produces a flipped
+/// output to measure the mirror half against; carrying it must wait for a measured producer.
 fn transform_degrees(t: sctk::reexports::client::protocol::wl_output::Transform) -> i32 {
     use sctk::reexports::client::protocol::wl_output::Transform;
     match t {
-        Transform::Normal | Transform::Flipped => 0,
-        Transform::_90 | Transform::Flipped90 => 90,
-        Transform::_180 | Transform::Flipped180 => 180,
-        Transform::_270 | Transform::Flipped270 => 270,
+        Transform::Normal => 0,
+        Transform::_90 => 90,
+        Transform::_180 => 180,
+        Transform::_270 => 270,
+        Transform::Flipped | Transform::Flipped90 | Transform::Flipped180
+        | Transform::Flipped270 => {
+            static FLIPPED_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !FLIPPED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "an output reports a flipped transform ({t:?}); only its rotation is \
+                     corrected, the mirror is not"
+                );
+            }
+            match t {
+                Transform::Flipped90 => 90,
+                Transform::Flipped180 => 180,
+                Transform::Flipped270 => 270,
+                _ => 0,
+            }
+        }
         _ => 0,
     }
 }
