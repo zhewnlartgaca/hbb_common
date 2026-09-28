@@ -2842,6 +2842,11 @@ pub fn use_ws() -> bool {
     option2bool(option, &Config::get_option(option))
 }
 
+pub fn ws_use_proxy() -> bool {
+    let option = keys::OPTION_ALLOW_WEBSOCKET_PROXY;
+    option2bool(option, &Config::get_option(option))
+}
+
 pub fn allow_insecure_tls_fallback() -> bool {
     let option = keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK;
     option2bool(option, &Config::get_option(option))
@@ -2869,6 +2874,7 @@ pub mod keys {
     pub const OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD: &str = "allow-numeric-one-time-password";
     pub const OPTION_DIRECT_SERVER: &str = "direct-server";
     pub const OPTION_ALLOW_WEBSOCKET: &str = "allow-websocket";
+    pub const OPTION_ALLOW_WEBSOCKET_PROXY: &str = "allow-websocket-proxy";
     pub const OPTION_TRACKPAD_SPEED: &str = "trackpad-speed";
     pub const OPTION_REGISTER_DEVICE: &str = "register-device";
     pub const OPTION_RELAY_SERVER: &str = "relay-server";
