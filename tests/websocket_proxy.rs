@@ -98,6 +98,7 @@ async fn proxy_round_trip(
     upsert_tls_cache(url, tls_type, true);
     let target = url::Url::parse(url).unwrap();
     let host = target.host_str().unwrap().to_owned();
+    let domain = target.domain().map(str::to_owned);
     let port = target.port_or_known_default().unwrap();
     let authority = match target.port() {
         Some(port) => format!("{host}:{port}"),
@@ -148,7 +149,7 @@ async fn proxy_round_trip(
         stream.flush().await.unwrap();
         if wss {
             let tls = tls_acceptor().accept(stream).await.unwrap();
-            assert_eq!(tls.get_ref().1.server_name(), Some(host.as_str()));
+            assert_eq!(tls.get_ref().1.server_name(), domain.as_deref());
             stream = DynTcpStream(Box::new(tls));
         }
         echo(stream, &path, &authority).await;
@@ -310,6 +311,11 @@ async fn websocket_proxy_connections() {
     // Keep configuration changes inside this integration test process.
     *APP_NAME.write().unwrap() = format!("RustDesk WebSocket Test {}", std::process::id());
     option(keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK, "Y");
+    for scheme in ["http", "https"] {
+        for url in ["ws://[::1]:21119", "wss://[::1]:21119"] {
+            proxy_round_trip(scheme, url, TlsType::Rustls, false, false).await;
+        }
+    }
     for (scheme, url, tls_type, auth, configured) in [
         (
             "http",

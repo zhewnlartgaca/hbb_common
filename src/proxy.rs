@@ -663,6 +663,10 @@ impl Proxy {
 
 fn get_domain_and_port<'a>(target_addr: &TargetAddr<'a>) -> Result<(String, u16), ProxyError> {
     match target_addr {
+        // CONNECT requires brackets around IPv6 literals in both the target and Host header.
+        tokio_socks::TargetAddr::Ip(SocketAddr::V6(addr)) => {
+            Ok((format!("[{}]", addr.ip()), addr.port()))
+        }
         tokio_socks::TargetAddr::Ip(addr) => Ok((addr.ip().to_string(), addr.port())),
         tokio_socks::TargetAddr::Domain(name, port) => Ok((name.to_string(), *port)),
     }
