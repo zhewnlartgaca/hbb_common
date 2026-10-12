@@ -428,8 +428,7 @@ impl Proxy {
                     TlsType::NativeTls => {
                         self.https_connect_nativetls_wrap_danger(
                             &url,
-                            local,
-                            proxy,
+                            stream,
                             &target_addr,
                             danger_accept_invalid_cert,
                         )
@@ -480,12 +479,10 @@ impl Proxy {
     async fn https_connect_nativetls_wrap_danger<'a>(
         &self,
         url: &str,
-        local: SocketAddr,
-        proxy: SocketAddr,
+        stream: tokio::net::TcpStream,
         target_addr: &TargetAddr<'a>,
         danger_accept_invalid_cert: Option<bool>,
     ) -> ResultType<DynTcpStream> {
-        let stream = self.new_stream(local, proxy).await?;
         let s = super::timeout(
             self.ms_timeout,
             self.https_connect_nativetls(
@@ -535,7 +532,10 @@ impl Proxy {
         danger_accept_invalid_cert: Option<bool>,
         origin_danger_accept_invalid_cert: Option<bool>,
     ) -> ResultType<DynTcpStream> {
-        let stream = stream.unwrap_or(self.new_stream(local, proxy).await?);
+        let stream = match stream {
+            Some(stream) => stream,
+            None => self.new_stream(local, proxy).await?,
+        };
         match super::timeout(
             self.ms_timeout,
             self.https_connect_rustls(
@@ -587,8 +587,7 @@ impl Proxy {
                     log::warn!("Falling back to native-tls for HTTPS proxy server.");
                     self.https_connect_nativetls_wrap_danger(
                         &url,
-                        local,
-                        proxy,
+                        self.new_stream(local, proxy).await?,
                         &target_addr,
                         origin_danger_accept_invalid_cert,
                     )
