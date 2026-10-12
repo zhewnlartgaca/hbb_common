@@ -18,7 +18,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
-    task::{ready, Context, Poll},
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
@@ -47,7 +47,10 @@ impl AsyncRead for FlushBeforeRead {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        ready!(Pin::new(&mut self.0).poll_flush(cx))?;
+        // A blocked writer must not prevent reading data that lets the peer make progress.
+        if let Poll::Ready(Err(err)) = Pin::new(&mut self.0).poll_flush(cx) {
+            return Poll::Ready(Err(err));
+        }
         Pin::new(&mut self.0).poll_read(cx, buf)
     }
 }
@@ -524,6 +527,9 @@ pub fn check_ws(endpoint: &str) -> String {
     };
     format!("{}://{}", protocol, address)
 }
+
+#[cfg(test)]
+mod proxy_tests;
 
 #[cfg(test)]
 mod tests {
