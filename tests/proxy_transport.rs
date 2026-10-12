@@ -1,6 +1,7 @@
 use hbb_common::{
     config::{APP_NAME, OVERWRITE_SETTINGS},
     proxy::{Proxy, ProxyError},
+    tcp::DynTcpStream,
     tls::{upsert_tls_cache, TlsType},
 };
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
@@ -28,24 +29,32 @@ fn tls_acceptor() -> TlsAcceptor {
     TlsAcceptor::from(Arc::new(config))
 }
 
-async fn https_connection(tls_type: TlsType, fixed_local_port: bool) {
+async fn proxy_connection(bind: &str, tls_type: TlsType, fixed_local_port: bool) {
     *APP_NAME.write().unwrap() = format!("RustDesk-proxy-review-{}", std::process::id());
     OVERWRITE_SETTINGS
         .write()
         .unwrap()
         .insert("allow-insecure-tls-fallback".into(), "Y".into());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("https://{}", listener.local_addr().unwrap());
+    let listener = TcpListener::bind(bind).await.unwrap();
+    let scheme = if matches!(tls_type, TlsType::Plain) {
+        "http"
+    } else {
+        "https"
+    };
+    let url = format!("{scheme}://{}", listener.local_addr().unwrap());
     upsert_tls_cache(&url, tls_type, true);
     let local = if fixed_local_port {
-        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reserved = TcpListener::bind(bind).await.unwrap();
         Some(reserved.local_addr().unwrap())
     } else {
         None
     };
     let server = tokio::spawn(async move {
         let (tcp, peer) = listener.accept().await.unwrap();
-        let mut stream = tls_acceptor().accept(tcp).await.unwrap();
+        let mut stream = DynTcpStream(Box::new(tcp));
+        if !matches!(tls_type, TlsType::Plain) {
+            stream = DynTcpStream(Box::new(tls_acceptor().accept(stream).await.unwrap()));
+        }
         let mut headers = Vec::new();
         while !headers.ends_with(b"\r\n\r\n") {
             assert!(headers.len() < 4096);
@@ -93,22 +102,22 @@ async fn https_connection(tls_type: TlsType, fixed_local_port: bool) {
 
 #[tokio::test]
 async fn https_rustls_reuses_initial_connection() {
-    https_connection(TlsType::Rustls, false).await;
+    proxy_connection("127.0.0.1:0", TlsType::Rustls, false).await;
 }
 
 #[tokio::test]
 async fn https_nativetls_reuses_initial_connection() {
-    https_connection(TlsType::NativeTls, false).await;
+    proxy_connection("127.0.0.1:0", TlsType::NativeTls, false).await;
 }
 
 #[tokio::test]
 async fn https_rustls_with_fixed_local_port() {
-    https_connection(TlsType::Rustls, true).await;
+    proxy_connection("127.0.0.1:0", TlsType::Rustls, true).await;
 }
 
 #[tokio::test]
 async fn https_nativetls_with_fixed_local_port() {
-    https_connection(TlsType::NativeTls, true).await;
+    proxy_connection("127.0.0.1:0", TlsType::NativeTls, true).await;
 }
 
 #[tokio::test]
@@ -148,4 +157,46 @@ async fn https_reconnects_for_tls_fallback() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn proxy_addresses_and_tls_names() {
+    for (scheme, default_port) in [("http", 80), ("https", 443)] {
+        for (host, tls_name) in [
+            ("[::1]", "::1"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("localhost", "localhost"),
+        ] {
+            for port in [None, Some(80), Some(443), Some(8443)] {
+                let authority = match port {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_owned(),
+                };
+                let proxy = Proxy::new(format!("{scheme}://{authority}"), TIMEOUT).unwrap();
+                let port = port.unwrap_or(default_port);
+                assert_eq!(
+                    proxy.intercept.get_domain().unwrap(),
+                    tls_name,
+                    "{scheme}://{authority}"
+                );
+                assert_eq!(
+                    proxy.intercept.get_host_and_port().unwrap(),
+                    format!("{host}:{port}")
+                );
+                let resolved = proxy.proxy_addrs().await.unwrap();
+                assert_eq!(resolved.port(), port);
+                assert!(resolved.ip().is_loopback());
+                if host == "[::1]" {
+                    assert!(resolved.is_ipv6());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn ipv6_proxy_connect_and_data_exchange() {
+    for tls_type in [TlsType::Plain, TlsType::Rustls, TlsType::NativeTls] {
+        proxy_connection("[::1]:0", tls_type, false).await;
+    }
 }
