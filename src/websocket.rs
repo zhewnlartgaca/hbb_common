@@ -1,7 +1,6 @@
 use crate::{
     config::{
-        keys::OPTION_RELAY_SERVER, use_ws, ws_use_proxy, Config, Socks5Server, RELAY_PORT,
-        RENDEZVOUS_PORT,
+        keys::OPTION_RELAY_SERVER, use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT,
     },
     protobuf::Message,
     socket_client::split_host_port,
@@ -299,11 +298,7 @@ impl WsFramedStream {
         local_addr: Option<SocketAddr>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
-        let proxy_conf = if ws_use_proxy() {
-            Config::get_socks()
-        } else {
-            None
-        };
+        let proxy_conf = Config::get_socks();
         let (stream, addr) =
             Self::connect(url.as_ref(), local_addr, proxy_conf.as_ref(), ms_timeout).await?;
 

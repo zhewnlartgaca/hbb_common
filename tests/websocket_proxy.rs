@@ -87,7 +87,6 @@ async fn proxy_round_trip(
     auth: bool,
     configured: bool,
 ) {
-    option(keys::OPTION_ALLOW_WEBSOCKET_PROXY, "Y");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = Socks5Server {
         proxy: format!("{scheme}://{}", listener.local_addr().unwrap()),
@@ -191,7 +190,6 @@ async fn rejected_or_stalled_proxy(stalled: bool, configured: bool) {
         proxy: format!("http://{}", listener.local_addr().unwrap()),
         ..Default::default()
     };
-    option(keys::OPTION_ALLOW_WEBSOCKET_PROXY, "Y");
     option(keys::OPTION_PROXY_URL, &proxy.proxy);
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
@@ -235,20 +233,11 @@ async fn rejected_or_stalled_proxy(stalled: bool, configured: bool) {
         .unwrap();
 }
 
-async fn direct_round_trip(setting: &str, configured: bool, wss: bool) {
-    option(keys::OPTION_ALLOW_WEBSOCKET_PROXY, setting);
-    let unused_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    if configured {
-        option(
-            keys::OPTION_PROXY_URL,
-            &format!("http://{}", unused_proxy.local_addr().unwrap()),
-        );
-    } else {
-        OVERWRITE_SETTINGS
-            .write()
-            .unwrap()
-            .remove(keys::OPTION_PROXY_URL);
-    }
+async fn direct_round_trip(wss: bool) {
+    OVERWRITE_SETTINGS
+        .write()
+        .unwrap()
+        .remove(keys::OPTION_PROXY_URL);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("{}://{addr}/ws/id", if wss { "wss" } else { "ws" });
@@ -267,9 +256,6 @@ async fn direct_round_trip(setting: &str, configured: bool, wss: bool) {
         .await
         .unwrap()
         .unwrap();
-    assert!(timeout(Duration::from_millis(50), unused_proxy.accept())
-        .await
-        .is_err());
 }
 
 async fn tcp_proxy_round_trip() {
@@ -278,7 +264,6 @@ async fn tcp_proxy_round_trip() {
         proxy: format!("http://{}", listener.local_addr().unwrap()),
         ..Default::default()
     };
-    option(keys::OPTION_ALLOW_WEBSOCKET_PROXY, "N");
     option(keys::OPTION_PROXY_URL, &proxy.proxy);
     option(keys::OPTION_PROXY_USERNAME, "");
     option(keys::OPTION_PROXY_PASSWORD, "");
@@ -408,12 +393,9 @@ async fn websocket_proxy_connections() {
     tcp_proxy_round_trip().await;
 
     for wss in [false, true] {
-        direct_round_trip("", true, wss).await;
-        direct_round_trip("N", true, wss).await;
-        direct_round_trip("Y", false, wss).await;
+        direct_round_trip(wss).await;
     }
 
-    option(keys::OPTION_ALLOW_WEBSOCKET_PROXY, "N");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
