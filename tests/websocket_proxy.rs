@@ -243,19 +243,22 @@ async fn direct_round_trip(wss: bool) {
     let url = format!("{}://{addr}/ws/id", if wss { "wss" } else { "ws" });
     upsert_tls_cache(&url, TlsType::Rustls, true);
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let (stream, client_addr) = listener.accept().await.unwrap();
         let mut stream = DynTcpStream(Box::new(stream));
         if wss {
             stream = DynTcpStream(Box::new(tls_acceptor().accept(stream).await.unwrap()));
         }
         echo(stream, "/ws/id", &addr.to_string()).await;
+        client_addr
     });
     let stream = socket_client::connect_tcp(url, TIMEOUT).await.unwrap();
+    let local_addr = stream.local_addr();
     exchange(stream).await;
-    timeout(Duration::from_millis(TIMEOUT), server)
+    let client_addr = timeout(Duration::from_millis(TIMEOUT), server)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(local_addr, client_addr);
 }
 
 async fn tcp_proxy_round_trip() {

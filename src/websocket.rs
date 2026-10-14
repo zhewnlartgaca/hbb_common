@@ -213,8 +213,8 @@ impl WsFramedStream {
                 match stream {
                     Either::Left(stream) => {
                         // MaybeTlsStream::get_ref() handles Plain, NativeTls and Rustls,
-                        // returning the underlying TcpStream for peer_addr().
-                        let addr = stream.get_ref().get_ref().peer_addr()?;
+                        // returning the underlying TcpStream for local_addr().
+                        let addr = stream.get_ref().get_ref().local_addr()?;
                         Ok((Either::Left(stream), addr))
                     }
                     Either::Right((stream, addr)) => Ok((Either::Right(stream), addr)),
